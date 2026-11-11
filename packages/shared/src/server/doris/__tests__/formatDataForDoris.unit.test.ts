@@ -59,35 +59,51 @@ describe("formatDataForDoris", () => {
       expect(result[0].tags).toEqual(["a", "b"]);
     });
 
-    it("should convert Date objects to ISO string", () => {
+    it("should convert Date objects to UTC SQL datetime strings", () => {
       const date = new Date("2024-01-15T10:30:00.000Z");
       const result = formatDataForDoris([{ created_at: date }]);
-      expect(result[0].created_at).toBe("2024-01-15T10:30:00.000Z");
+      expect(result[0].created_at).toBe("2024-01-15 10:30:00.000");
     });
 
-    it("should convert timestamp fields from number to ISO string", () => {
+    it("should convert epoch timestamps to UTC SQL datetime strings", () => {
       const ts = new Date("2024-06-15T12:00:00.000Z").getTime();
       const result = formatDataForDoris([{ timestamp: ts }]);
-      expect(result[0].timestamp).toBe("2024-06-15T12:00:00.000Z");
+      expect(result[0].timestamp).toBe("2024-06-15 12:00:00.000");
     });
 
-    it("should convert timestamp fields from string to ISO string", () => {
+    it("should serialize ISO timestamps for Doris 3.1 MoW key columns", () => {
       const result = formatDataForDoris([
         { start_time: "2024-06-15T12:00:00.000Z" },
       ]);
-      expect(result[0].start_time).toBe("2024-06-15T12:00:00.000Z");
+      expect(result[0].start_time).toBe("2024-06-15 12:00:00.000");
     });
 
-    it("should convert dataset_run_created_at from number epoch to ISO string", () => {
+    it("should convert dataset_run_created_at to UTC SQL datetime", () => {
       const ts = new Date("2024-06-15T12:00:00.000Z").getTime();
       const result = formatDataForDoris([{ dataset_run_created_at: ts }]);
-      expect(result[0].dataset_run_created_at).toBe("2024-06-15T12:00:00.000Z");
+      expect(result[0].dataset_run_created_at).toBe("2024-06-15 12:00:00.000");
     });
 
-    it("should convert dataset_item_version from number epoch to ISO string", () => {
+    it("should convert dataset_item_version to UTC SQL datetime", () => {
       const ts = new Date("2024-06-15T12:00:00.000Z").getTime();
       const result = formatDataForDoris([{ dataset_item_version: ts }]);
-      expect(result[0].dataset_item_version).toBe("2024-06-15T12:00:00.000Z");
+      expect(result[0].dataset_item_version).toBe("2024-06-15 12:00:00.000");
+    });
+
+    it("preserves the instant when the input has a timezone offset", () => {
+      const result = formatDataForDoris(
+        [{ start_time: "2026-11-11T16:46:25.123+08:00" }],
+        "traces_scalar_compat",
+      );
+      expect(result[0].start_time).toBe("2026-11-11 08:46:25.123");
+    });
+
+    it("treats timezone-less timestamps as UTC and keeps millisecond precision", () => {
+      const result = formatDataForDoris(
+        [{ start_time: "2026-11-11 08:46:25.123" }],
+        "traces_scalar_compat",
+      );
+      expect(result[0].start_time).toBe("2026-11-11 08:46:25.123");
     });
 
     it("should leave null values as null", () => {

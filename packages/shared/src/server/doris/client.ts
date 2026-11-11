@@ -32,6 +32,63 @@ const STRING_FIELD_TYPES = new Set([
   "SET",
 ]);
 
+// Doris 3.1 lacks the metadata-flatten and tag-union functions used upstream.
+// Keep these compatibility rewrites at the shared query boundary. Skip SQL
+// literals, quoted identifiers and comments so filter text is never rewritten.
+function queryForDoris31(sql: string) {
+  let flattenMetadata = false;
+  const query = sql.replace(
+    /'(?:''|\\.|[^'\\])*'|"(?:""|\\.|[^"\\])*"|`(?:``|[^`])*`|--[^\r\n]*|#[^\r\n]*|\/\*[\s\S]*?\*\/|\bjson_object_flatten\s*\(\s*((?:[a-z_]\w*\.)?metadata)\s*\)|\bgroup_array_union\s*\(\s*((?:[a-z_]\w*\.)?tags)\s*\)/gi,
+    (match, column: string | undefined, tagsColumn: string | undefined) => {
+      if (tagsColumn) {
+        // Aggregate arrays before flattening, so session token/cost sums do
+        // not multiply with tag count as they would with LATERAL VIEW.
+        return `array_distinct(array_flatten(collect_list(${tagsColumn})))`;
+      }
+      if (!column) return match;
+      flattenMetadata = true;
+      return `CAST(${column} AS STRING)`;
+    },
+  );
+  return { query, flattenMetadata };
+}
+
+function flattenMetadataRow(row: Record<string, unknown>) {
+  const original = row.metadata;
+  let metadata = original;
+  if (typeof metadata === "string") {
+    try {
+      metadata = JSON.parse(metadata);
+    } catch {
+      return row;
+    }
+  }
+  if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) {
+    return row;
+  }
+  const flat = Object.create(null) as Record<string, unknown>;
+  const visit = (object: object, prefix = "") => {
+    for (const [key, value] of Object.entries(object)) {
+      const path = prefix ? `${prefix}.${key}` : key;
+      if (
+        value !== null &&
+        typeof value === "object" &&
+        !Array.isArray(value) &&
+        Object.keys(value).length > 0
+      ) {
+        visit(value, path);
+      } else {
+        flat[path] = value;
+      }
+    }
+  };
+  visit(metadata);
+  return {
+    ...row,
+    metadata: typeof original === "string" ? JSON.stringify(flat) : flat,
+  };
+}
+
 export interface DorisStreamLoadOptions {
   format?: "json" | "csv";
   columns?: string;
@@ -300,6 +357,25 @@ export class DorisClient {
 
       this.connectionPool = mysql.createPool(poolConfig);
 
+      // Queue initialization before the pool lends each new connection. Doris
+      // 3.1 requires this session setting for trace deletes across partitions.
+      (this.connectionPool as unknown as import("events").EventEmitter).on(
+        "connection",
+        (connection: import("mysql2").PoolConnection) => {
+          connection.query(
+            "SET SESSION delete_without_partition = true",
+            (error) => {
+              if (error) {
+                logger.error("Failed to initialize Doris connection session", {
+                  error: error.message,
+                });
+                connection.destroy();
+              }
+            },
+          );
+        },
+      );
+
       // Attach a pool-level 'error' listener. mysql2 emits this for
       // connection-level failures that happen OUTSIDE of a query promise —
       // e.g. handshake rejection ("Reach limit of connections"), background
@@ -378,8 +454,9 @@ export class DorisClient {
         });
       }
 
+      const compatible = queryForDoris31(finalQuery);
       const queryStartTime = Date.now();
-      const [rows] = await this.connectionPool.query(finalQuery);
+      const [rows] = await this.connectionPool.query(compatible.query);
       const queryDurationMs = Date.now() - queryStartTime;
 
       logger.debug("Doris query completed", {
@@ -393,7 +470,13 @@ export class DorisClient {
         logger.warn(`doris:slow-query (${queryDurationMs}ms) ${finalQuery}`);
       }
 
-      return Array.isArray(rows) ? rows : [];
+      return Array.isArray(rows)
+        ? compatible.flattenMetadata
+          ? rows.map((row) =>
+              flattenMetadataRow(row as Record<string, unknown>),
+            )
+          : rows
+        : [];
     } catch (error) {
       const errMsg = error instanceof Error ? error.message : String(error);
       logger.error(`Doris query failed: ${errMsg}, SQL: ${queryString}`);
@@ -508,12 +591,15 @@ export class DorisClient {
       // promise wrapper does not expose `.stream()`, but we can reach the
       // underlying callback connection at `.connection`.
       const underlying = (conn as unknown as { connection: any }).connection;
-      const stream = underlying.query(sql).stream({ highWaterMark });
+      const compatible = queryForDoris31(sql);
+      const stream = underlying
+        .query(compatible.query)
+        .stream({ highWaterMark });
 
       let rowCount = 0;
       for await (const row of stream) {
         rowCount++;
-        yield row as T;
+        yield (compatible.flattenMetadata ? flattenMetadataRow(row) : row) as T;
       }
 
       const durationMs = Date.now() - startTime;
@@ -1141,6 +1227,13 @@ const parseTimestamp = (value: unknown): Date | null => {
 };
 
 /**
+ * Serialize UTC timestamps without a zone suffix. Stream Load already sends
+ * timezone=UTC; Doris 3.1 MoW key conversion rejects the ISO T/Z form.
+ */
+const formatDorisTimestamp = (date: Date): string =>
+  date.toISOString().replace("T", " ").replace("Z", "");
+
+/**
  * Normalize field value for Doris compatibility
  */
 const normalizeValue = (key: string, value: unknown): unknown => {
@@ -1150,13 +1243,13 @@ const normalizeValue = (key: string, value: unknown): unknown => {
   // Handle arrays - empty arrays become null
   if (Array.isArray(value)) return value.length > 0 ? value : null;
 
-  // Handle Date objects - convert to ISO string
-  if (value instanceof Date) return value.toISOString();
+  // Handle Date objects without changing the represented instant.
+  if (value instanceof Date) return formatDorisTimestamp(value);
 
-  // Handle timestamp fields - convert to ISO string
+  // Handle timestamp fields - normalize to UTC SQL datetime strings.
   if (TIMESTAMP_FIELDS.includes(key as any) && value != null) {
     const date = parseTimestamp(value);
-    return date ? date.toISOString() : value;
+    return date ? formatDorisTimestamp(date) : value;
   }
 
   return value;
