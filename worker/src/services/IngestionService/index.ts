@@ -1667,9 +1667,9 @@ export class IngestionService {
         span.setAttribute("projectId", projectId);
 
         // Convert query for Doris MySQL-compatible format
-        // Use to_json() for MAP/ARRAY columns because Doris's MySQL protocol
-        // serialization of raw MAP columns does not properly escape quotes
-        // in TEXT values that contain nested JSON.
+        // Cast complex columns to JSON to preserve embedded quotes through
+        // the MySQL protocol. Doris 3.1 does not provide to_json() for these
+        // types, and casting MAP directly to STRING is not supported.
         const mapColumns: Record<string, string[]> = {
           [TableName.Traces]: ["metadata"],
           [TableName.Observations]: [
@@ -1688,7 +1688,7 @@ export class IngestionService {
         const mapsForTable = mapColumns[table] || [];
         const selectClause =
           mapsForTable.length > 0
-            ? `SELECT * EXCEPT(${mapsForTable.join(", ")}), ${mapsForTable.map((c) => `to_json(${c}) as ${c}`).join(", ")}`
+            ? `SELECT * EXCEPT(${mapsForTable.join(", ")}), ${mapsForTable.map((c) => `CAST(${c} AS JSON) as ${c}`).join(", ")}`
             : `SELECT *`;
         let dorisQuery = `
           ${selectClause}

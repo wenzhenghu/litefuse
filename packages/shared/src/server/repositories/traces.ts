@@ -387,8 +387,8 @@ export const getTraceUsageBreakdown = async ({
   }>({
     query: `
       SELECT
-        to_json(usage_details) AS usage_details,
-        to_json(cost_details) AS cost_details
+        CAST(usage_details AS JSON) AS usage_details,
+        CAST(cost_details AS JSON) AS cost_details
       FROM ${tableFor(projectId, "spans")}
       WHERE project_id = {projectId: String}
       AND trace_id = {traceId: String}
