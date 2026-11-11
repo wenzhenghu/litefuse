@@ -253,7 +253,7 @@ export async function getRelevantObservations(
 
   // spans layout: each observation span is a row with parent_span_id
   // != '' (root spans are the trace itself, handled by getRelevantTraces).
-  // metadata is read via to_json(metadata) (raw MAP text does not escape inner quotes); we
+  // metadata is read via CAST(metadata AS JSON) to preserve embedded quotes; we
   // parse it in TS after the read and synthesize the Map shape that
   // SpanRecord exposes. Dedup-per-span via ROW_NUMBER (Doris has no
   // LIMIT N BY).
@@ -292,7 +292,7 @@ export async function getRelevantObservations(
         o.tool_call_names,
         o.usage_pricing_tier_id,
         o.usage_pricing_tier_name,
-        to_json(o.metadata) AS metadata,
+        CAST(o.metadata AS JSON) AS metadata,
         coalesce(o.source, 'experiment-backfill') AS source,
         o.tags AS tags,
         o.bookmarked AS bookmarked,
@@ -395,7 +395,7 @@ export async function getRelevantTraces(
         map() AS tool_definitions,
         [] AS tool_calls,
         [] AS tool_call_names,
-        to_json(o.metadata) AS metadata,
+        CAST(o.metadata AS JSON) AS metadata,
         coalesce(o.source, 'experiment-backfill') AS source,
         o.tags AS tags,
         o.bookmarked AS bookmarked,
