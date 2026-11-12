@@ -157,6 +157,8 @@ const RESPONSE_LOG_MAX_CHARS = 1000;
 
 export interface DorisClientConfig {
   feHttpUrl?: string;
+  feHttpUrls?: string[];
+  feConnectTimeoutMs?: number;
   feQueryPort?: number;
   database?: string;
   username?: string;
@@ -171,8 +173,75 @@ export interface DorisClientConfig {
 
 export type DorisClientType = DorisClient;
 
+type FrontendProtocol = "http" | "mysql";
+type Frontend = {
+  url: string;
+  pool: mysql.Pool | null;
+  retryAt: Record<FrontendProtocol, number>;
+};
+
+function frontendUrls(config: DorisClientConfig): string[] {
+  const configured =
+    config.feHttpUrls ??
+    (config.feHttpUrl !== undefined
+      ? [config.feHttpUrl]
+      : (env.DORIS_FE_HTTP_URLS ?? [env.DORIS_FE_HTTP_URL]));
+  const values =
+    typeof configured === "string" ? configured.split(",") : configured;
+  if (!values.length || values.some((value) => !value.trim())) {
+    throw new Error("Doris FE list must contain non-empty HTTP URLs");
+  }
+  return [
+    ...new Set(
+      values.map((value) => {
+        const url = new URL(value.trim());
+        if (url.protocol !== "http:" && url.protocol !== "https:") {
+          throw new Error("Doris FE URLs must use HTTP or HTTPS");
+        }
+        return url.toString().replace(/\/+$/, "");
+      }),
+    ),
+  ];
+}
+
+function isConnectionFailure(error: unknown): boolean {
+  return new Set([
+    "ECONNREFUSED",
+    "ECONNRESET",
+    "ECONNABORTED",
+    "ETIMEDOUT",
+    "EPIPE",
+    "EHOSTUNREACH",
+    "ENETUNREACH",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "PROTOCOL_CONNECTION_LOST",
+    "PROTOCOL_SEQUENCE_TIMEOUT",
+    "PROTOCOL_ENQUEUE_AFTER_FATAL_ERROR",
+  ]).has((error as { code?: string } | undefined)?.code ?? "");
+}
+
+// Only clearly read-only statements may be replayed after dispatch. Unknown
+// statements (including WITH) and mutations retain the original exception.
+function canReplayQuery(sql: string): boolean {
+  // Strip quoted values/identifiers and comments before checking the statement
+  // boundary. SELECT ... INTO OUTFILE and multi-statement calls can write data.
+  const statement = sql
+    .replace(
+      /'(?:''|\\.|[^'\\])*'|"(?:""|\\.|[^"\\])*"|`(?:``|[^`])*`|--[^\r\n]*|#[^\r\n]*|\/\*[\s\S]*?\*\//g,
+      " ",
+    )
+    .trim()
+    .replace(/;\s*$/, "");
+  return (
+    /^(SELECT|SHOW|DESC|DESCRIBE|EXPLAIN)\b/i.test(statement) &&
+    !statement.includes(";") &&
+    !/\bINTO\s+OUTFILE\b/i.test(statement)
+  );
+}
+
 /**
- * DorisClient provides HTTP-based data loading and JDBC-based querying capabilities for Apache Doris
+ * DorisClient provides HTTP Stream Load and MySQL-protocol queries for Apache Doris.
  * Focuses on Stream Load functionality for high-performance data ingestion and MySQL protocol for queries
  */
 export class DorisClient {
@@ -186,13 +255,23 @@ export class DorisClient {
   private httpsAgent: https.Agent;
   private config: Required<DorisClientConfig>;
   private connectionPool: mysql.Pool | null = null;
+  private frontends: Frontend[];
+  private nextFrontend: Record<FrontendProtocol, number> = {
+    http: 0,
+    mysql: 0,
+  };
 
   constructor(config: DorisClientConfig = {}) {
     const maxSockets =
       config.maxSockets ?? env.LITEFUSE_INGESTION_DORIS_HTTP_MAX_SOCKETS ?? 100;
 
+    const urls = frontendUrls(config);
     this.config = {
-      feHttpUrl: config.feHttpUrl ?? env.DORIS_FE_HTTP_URL,
+      feHttpUrl: urls[0],
+      feHttpUrls: urls,
+      feConnectTimeoutMs: Number(
+        config.feConnectTimeoutMs ?? env.DORIS_FE_CONNECT_TIMEOUT_MS ?? 3000,
+      ),
       feQueryPort: config.feQueryPort ?? env.DORIS_FE_QUERY_PORT,
       database: config.database ?? env.DORIS_DB,
       username: config.username ?? env.DORIS_USER ?? "root",
@@ -206,6 +285,17 @@ export class DorisClient {
         config.maxOpenConnections ?? env.DORIS_MAX_OPEN_CONNECTIONS,
       maxSockets,
     } as Required<DorisClientConfig>;
+    if (
+      !Number.isFinite(this.config.feConnectTimeoutMs) ||
+      this.config.feConnectTimeoutMs <= 0
+    ) {
+      throw new Error("Doris FE connect timeout must be a positive number");
+    }
+    this.frontends = urls.map((url) => ({
+      url,
+      pool: null,
+      retryAt: { http: 0, mysql: 0 },
+    }));
 
     // keepAlive + maxFreeSockets so stream-load sockets get reused instead of
     // accumulating one TCP connection per request. socket-level timeout closes
@@ -300,10 +390,16 @@ export class DorisClient {
   }
 
   private initializeConnectionPool(): void {
+    for (const frontend of this.frontends) {
+      this.initializeFrontendPool(frontend);
+    }
+  }
+
+  private initializeFrontendPool(frontend: Frontend): void {
     try {
       // Extract hostname from HTTP URL for MySQL connection
-      const url = new URL(this.config.feHttpUrl);
-      const host = url.hostname;
+      const url = new URL(frontend.url);
+      const host = url.hostname.replace(/^\[|\]$/g, "");
 
       const poolConfig: any = {
         host: host,
@@ -317,7 +413,10 @@ export class DorisClient {
         keepAliveInitialDelay: 0,
         acquireTimeout: this.config.timeout,
         timeout: this.config.timeout,
-        connectTimeout: this.config.timeout,
+        connectTimeout:
+          this.frontends.length > 1
+            ? this.config.feConnectTimeoutMs
+            : this.config.timeout,
         timezone: "+00:00", // Doris stores UTC timestamps, tell mysql2 to interpret them as UTC
         // Handle JSON columns: try to parse, but return raw string on failure
         // This handles cases where Doris stores non-JSON strings in variant columns
@@ -355,11 +454,13 @@ export class DorisClient {
         poolConfig.database = this.config.database;
       }
 
-      this.connectionPool = mysql.createPool(poolConfig);
+      const pool = mysql.createPool(poolConfig);
+      frontend.pool = pool;
+      this.connectionPool ??= pool;
 
       // Queue initialization before the pool lends each new connection. Doris
       // 3.1 requires this session setting for trace deletes across partitions.
-      (this.connectionPool as unknown as import("events").EventEmitter).on(
+      (pool as unknown as import("events").EventEmitter).on(
         "connection",
         (connection: import("mysql2").PoolConnection) => {
           connection.query(
@@ -390,9 +491,10 @@ export class DorisClient {
       // connection-acquire/keep-alive failures, so we cast to attach a
       // listener. Without this, Doris rejecting a new connection
       // ("Reach limit of connections") crashes the worker process.
-      (this.connectionPool as unknown as import("events").EventEmitter).on(
+      (pool as unknown as import("events").EventEmitter).on(
         "error",
         (err: unknown) => {
+          if (isConnectionFailure(err)) this.frontendFailed(frontend, "mysql");
           logger.error("Doris MySQL pool emitted error event (swallowed)", {
             error: err instanceof Error ? err.message : String(err),
             code: (err as { code?: string } | undefined)?.code,
@@ -410,6 +512,114 @@ export class DorisClient {
         error: error instanceof Error ? error.message : String(error),
       });
     }
+  }
+
+  private frontendCandidates(protocol: FrontendProtocol): Frontend[] {
+    const ordered = this.frontends.map(
+      (_, offset) =>
+        this.frontends[
+          (this.nextFrontend[protocol] + offset) % this.frontends.length
+        ],
+    );
+    const now = Date.now();
+    return [
+      ...ordered.filter((fe) => fe.retryAt[protocol] <= now),
+      ...ordered.filter((fe) => fe.retryAt[protocol] > now),
+    ];
+  }
+
+  private frontendFailed(frontend: Frontend, protocol: FrontendProtocol): void {
+    frontend.retryAt[protocol] = Date.now() + 10_000;
+    logger.warn("Doris FE unavailable", {
+      frontend: new URL(frontend.url).origin,
+      protocol,
+    });
+  }
+
+  private frontendSucceeded(
+    frontend: Frontend,
+    protocol: FrontendProtocol,
+  ): void {
+    frontend.retryAt[protocol] = 0;
+    this.nextFrontend[protocol] =
+      (this.frontends.indexOf(frontend) + 1) % this.frontends.length;
+  }
+
+  private async mysqlConnection(
+    attempted: Set<Frontend>,
+  ): Promise<{ frontend: Frontend; connection: mysql.PoolConnection }> {
+    let lastError: unknown = new Error("MySQL connection pool not initialized");
+    for (const frontend of this.frontendCandidates("mysql")) {
+      if (attempted.has(frontend) || !frontend.pool) continue;
+      attempted.add(frontend);
+      try {
+        const connection = await frontend.pool.getConnection();
+        this.frontendSucceeded(frontend, "mysql");
+        return { frontend, connection };
+      } catch (error) {
+        if (!isConnectionFailure(error)) throw error;
+        this.frontendFailed(frontend, "mysql");
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
+  private async queryAcrossFrontends(sql: string): Promise<unknown> {
+    const attempted = new Set<Frontend>();
+    while (true) {
+      const { frontend, connection } = await this.mysqlConnection(attempted);
+      let destroyed = false;
+      try {
+        const [rows] = await connection.query({
+          sql,
+          timeout: this.config.timeout,
+        });
+        return rows;
+      } catch (error) {
+        if (!isConnectionFailure(error)) throw error;
+        this.frontendFailed(frontend, "mysql");
+        connection.destroy();
+        destroyed = true;
+        if (!canReplayQuery(sql) || attempted.size >= this.frontends.length)
+          throw error;
+      } finally {
+        if (!destroyed) connection.release();
+      }
+    }
+  }
+
+  private async httpAcrossFrontends<T>(
+    request: (url: string) => Promise<T>,
+  ): Promise<{ result: T; url: string }> {
+    let lastError: unknown;
+    for (const frontend of this.frontendCandidates("http")) {
+      try {
+        const result = await request(frontend.url);
+        this.frontendSucceeded(frontend, "http");
+        return { result, url: frontend.url };
+      } catch (error) {
+        const status = (error as { response?: { status?: number } })?.response
+          ?.status;
+        if (
+          !isConnectionFailure(error) &&
+          ![502, 503, 504].includes(status ?? 0)
+        )
+          throw error;
+        this.frontendFailed(frontend, "http");
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
+  private frontendRequestTimeout(): number {
+    return this.frontends.length > 1
+      ? Math.min(
+          this.config.feConnectTimeoutMs,
+          this.config.timeout || Infinity,
+        )
+      : this.config.timeout;
   }
 
   /**
@@ -456,7 +666,10 @@ export class DorisClient {
 
       const compatible = queryForDoris31(finalQuery);
       const queryStartTime = Date.now();
-      const [rows] = await this.connectionPool.query(compatible.query);
+      const rows =
+        this.frontends.length === 1
+          ? (await this.connectionPool.query(compatible.query))[0]
+          : await this.queryAcrossFrontends(compatible.query);
       const queryDurationMs = Date.now() - queryStartTime;
 
       logger.debug("Doris query completed", {
@@ -584,40 +797,62 @@ export class DorisClient {
 
     const highWaterMark = options.highWaterMark ?? 1000;
     const startTime = Date.now();
-    const conn = await this.connectionPool.getConnection();
+    const attempted = new Set<Frontend>();
+    const compatible = queryForDoris31(sql);
+    let rowCount = 0;
+    while (true) {
+      const { frontend, connection: conn } =
+        await this.mysqlConnection(attempted);
+      let destroyed = false;
+      try {
+        // mysql2/promise's PoolConnection wraps a callback Connection. The
+        // promise wrapper does not expose `.stream()`, but we can reach the
+        // underlying callback connection at `.connection`.
+        const underlying = (conn as unknown as { connection: any }).connection;
+        const stream = underlying
+          .query(
+            this.frontends.length > 1
+              ? { sql: compatible.query, timeout: this.config.timeout }
+              : compatible.query,
+          )
+          .stream({ highWaterMark });
 
-    try {
-      // mysql2/promise's PoolConnection wraps a callback Connection. The
-      // promise wrapper does not expose `.stream()`, but we can reach the
-      // underlying callback connection at `.connection`.
-      const underlying = (conn as unknown as { connection: any }).connection;
-      const compatible = queryForDoris31(sql);
-      const stream = underlying
-        .query(compatible.query)
-        .stream({ highWaterMark });
+        for await (const row of stream) {
+          rowCount++;
+          yield (
+            compatible.flattenMetadata ? flattenMetadataRow(row) : row
+          ) as T;
+        }
 
-      let rowCount = 0;
-      for await (const row of stream) {
-        rowCount++;
-        yield (compatible.flattenMetadata ? flattenMetadataRow(row) : row) as T;
+        const durationMs = Date.now() - startTime;
+        logger.debug("Doris stream query completed", {
+          rowCount,
+          durationMs,
+        });
+        if (durationMs > env.LITEFUSE_DORIS_SLOW_QUERY_THRESHOLD_MS) {
+          logger.warn(
+            `doris:slow-stream-query (${durationMs}ms, ${rowCount} rows) ${sql}`,
+          );
+        }
+        return;
+      } catch (error) {
+        const errMsg = error instanceof Error ? error.message : String(error);
+        logger.error(`Doris stream query failed: ${errMsg}, SQL: ${sql}`);
+        if (isConnectionFailure(error)) {
+          this.frontendFailed(frontend, "mysql");
+          conn.destroy();
+          destroyed = true;
+        }
+        if (
+          !destroyed ||
+          rowCount > 0 ||
+          !canReplayQuery(sql) ||
+          attempted.size >= this.frontends.length
+        )
+          throw error;
+      } finally {
+        if (!destroyed) conn.release();
       }
-
-      const durationMs = Date.now() - startTime;
-      logger.debug("Doris stream query completed", {
-        rowCount,
-        durationMs,
-      });
-      if (durationMs > env.LITEFUSE_DORIS_SLOW_QUERY_THRESHOLD_MS) {
-        logger.warn(
-          `doris:slow-stream-query (${durationMs}ms, ${rowCount} rows) ${sql}`,
-        );
-      }
-    } catch (error) {
-      const errMsg = error instanceof Error ? error.message : String(error);
-      logger.error(`Doris stream query failed: ${errMsg}, SQL: ${sql}`);
-      throw error;
-    } finally {
-      conn.release();
     }
   }
 
@@ -636,6 +871,7 @@ export class DorisClient {
     // times the body size on every attempt. Streams pass through untouched.
     data: Readable | undefined,
     authHeaders: Record<string, string>,
+    frontendUrl?: string,
   ) {
     const isAbsolute = /^https?:\/\//i.test(urlOrPath);
     return this.streamLoadClient.put(urlOrPath, data, {
@@ -646,7 +882,8 @@ export class DorisClient {
       // Absolute URLs (BE redirect target) must not inherit the FE baseURL.
       // Pass an empty string rather than undefined; axios falls back to the
       // instance baseURL when the config value is missing.
-      baseURL: isAbsolute ? "" : this.config.feHttpUrl,
+      baseURL: isAbsolute ? "" : (frontendUrl ?? this.config.feHttpUrl),
+      timeout: isAbsolute ? this.config.timeout : this.frontendRequestTimeout(),
       validateStatus: (status: number) => status >= 200 && status < 400,
     });
   }
@@ -805,12 +1042,14 @@ export class DorisClient {
         }
         throw e;
       };
-      const feUrl = `${this.config.feHttpUrl}${url}`;
-
       logger.debug("DorisClient: Sending empty-body probe PUT to FE", { url });
-      const probe = await this.streamLoadPut(url, undefined, authHeaders).catch(
-        (e) => tagLeg(e, "FE probe PUT", feUrl),
-      );
+      const { result: probe, url: selectedFrontend } =
+        await this.httpAcrossFrontends((frontendUrl) =>
+          this.streamLoadPut(url, undefined, authHeaders, frontendUrl).catch(
+            (error) => tagLeg(error, "FE probe PUT", `${frontendUrl}${url}`),
+          ),
+        );
+      const feUrl = `${selectedFrontend}${url}`;
 
       if (probe.status !== 307 || !probe.headers?.location) {
         // The probe didn't get the expected 307 redirect. Report the facts
@@ -1045,7 +1284,12 @@ export class DorisClient {
    */
   async healthCheck(): Promise<boolean> {
     try {
-      const response = await this.httpClient.get("/api/health");
+      const { result: response } = await this.httpAcrossFrontends((baseURL) =>
+        this.httpClient.get("/api/health", {
+          baseURL,
+          timeout: this.frontendRequestTimeout(),
+        }),
+      );
       return response.status === 200;
     } catch (error) {
       logger.error("Doris health check failed", { error });
@@ -1059,8 +1303,11 @@ export class DorisClient {
    */
   async getDatabaseInfo(): Promise<any> {
     try {
-      const response = await this.httpClient.get(
-        `/api/${this.config.database}`,
+      const { result: response } = await this.httpAcrossFrontends((baseURL) =>
+        this.httpClient.get(`/api/${this.config.database}`, {
+          baseURL,
+          timeout: this.frontendRequestTimeout(),
+        }),
       );
       return response.data;
     } catch (error) {
@@ -1073,14 +1320,15 @@ export class DorisClient {
    * Close the client connection and MySQL connection pool
    */
   async close(): Promise<void> {
-    if (this.connectionPool) {
-      await this.connectionPool.end();
-      this.connectionPool = null;
-      logger.debug("Doris MySQL connection pool closed");
-    }
+    const pools = this.frontends.flatMap((fe) => (fe.pool ? [fe.pool] : []));
+    this.connectionPool = null;
+    for (const fe of this.frontends) fe.pool = null;
+    const results = await Promise.allSettled(pools.map((pool) => pool.end()));
     this.httpAgent.destroy();
     this.httpsAgent.destroy();
     logger.debug("Doris client closed");
+    const failure = results.find((result) => result.status === "rejected");
+    if (failure?.status === "rejected") throw failure.reason;
   }
 }
 
@@ -1115,7 +1363,11 @@ export class DorisClientManager {
    */
   private generateClientKey(config: DorisClientConfig): string {
     const keyParams = {
-      feHttpUrl: config.feHttpUrl ?? env.DORIS_FE_HTTP_URL,
+      feHttpUrls: frontendUrls(config),
+      feQueryPort: Number(config.feQueryPort ?? env.DORIS_FE_QUERY_PORT),
+      feConnectTimeoutMs: Number(
+        config.feConnectTimeoutMs ?? env.DORIS_FE_CONNECT_TIMEOUT_MS ?? 3000,
+      ),
       database: config.database ?? env.DORIS_DB,
       username: config.username ?? env.DORIS_USER,
       timeout: config.timeout ?? env.DORIS_REQUEST_TIMEOUT_MS,

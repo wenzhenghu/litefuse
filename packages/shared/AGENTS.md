@@ -92,3 +92,11 @@ consumers are registered by `worker/src/app.ts`.
 - `spans` contains both trace roots and observation spans; there is no
   physical `observations` table. A trace telemetry delete removes its
   `spans` rows once and mirrors the delete to `traces_scalar`.
+- Doris clients accept `DORIS_FE_HTTP_URLS` as a comma-separated FE list;
+  `DORIS_FE_HTTP_URL` remains the single-FE fallback. Explicit client URLs
+  override environment defaults. `DORIS_FE_CONNECT_TIMEOUT_MS` bounds new
+  connections and empty HTTP probes; SQL and BE uploads keep their request timeout.
+- Each FE has its own pool and session initialization. The connection limit is
+  per FE. Retry only connection acquisition, unambiguous reads before any rows
+  reach a consumer, and empty FE probes; never replay a dispatched mutation or
+  a BE body upload whose commit outcome may be unknown.

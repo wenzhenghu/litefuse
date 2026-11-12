@@ -63,6 +63,9 @@ const EnvSchema = z.object({
   // Doris configuration
   DORIS_URL: z.string().url().optional(),
   DORIS_FE_HTTP_URL: z.string().url().default("http://localhost:8030"),
+  // Optional comma-separated FE URLs; used for both HTTP and MySQL failover.
+  DORIS_FE_HTTP_URLS: z.string().optional(),
+  DORIS_FE_CONNECT_TIMEOUT_MS: z.coerce.number().int().positive().default(3000),
   DORIS_FE_QUERY_PORT: z.coerce.number().positive().default(9030),
   DORIS_DB: z.string().default("langfuse"),
   DORIS_USER: z.string().optional(),
