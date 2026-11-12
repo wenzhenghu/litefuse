@@ -44,6 +44,9 @@ litefuse/
   Single-project SQL must use `tableFor`; cross-project SQL must use the
   project fan-out executor. Web and worker boot are gated on the first split
   snapshot for provisioning/readiness state, not shared fallback.
+- The shared Doris client supports native multi-FE HTTP and MySQL failover;
+  Web and Worker use the same FE-list configuration and retry-safety contract
+  documented in `packages/shared/AGENTS.md`.
 
 ## Build, Test, and Development Commands
 
